@@ -1,0 +1,182 @@
+---
+title: "Demographics - CNICS"
+author: "Heather Henderson"
+format: html
+editor: visual
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+packages <- function(x){
+  for(i in x){
+     if(!require(i, character.only = TRUE)){
+      install.packages(i, dependencies = TRUE)
+       library(i, character.only = TRUE)
+    }
+  }
+}
+packages(c("haven", "readxl", "readr", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", "kableExtra", "DT", "formatR", "zoo", "tableone", "broom", "arsenal", "janitor"))
+```
+
+# Data files
+
+```{r}
+setwd("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations")
+
+demographic <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/demographic.sas7bdat")
+geographic <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/geographic.sas7bdat")
+insurance <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/insurance.sas7bdat")
+riskfactor <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/riskfactor.sas7bdat")
+fips <- read_excel("J:/ID/CFAR/ID Clinic Database/Projects/Heather/geocoder/fips_nums_all.xlsx")
+adi <- fread("C:/Users/henderh/OneDrive - University of North Carolina at Chapel Hill/Projects/AMR/AMR_mapping_project/NC data/NC_2022_ADI_Zip Code.csv")
+```
+
+# Demographics
+
+```{r}
+demographic1 <- demographic |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key),
+         race_eth = factor(case_when(race %in% c("american indian", "asian", "") ~ "other",
+                                     hispanic == "yes" ~ "hispanic",
+                                     TRUE ~ race),
+                           levels = c("black", "white", "hispanic", "other"))) |>
+  select(patient_key, birth_year, birth_sex, race_eth, death_date) |>
+  filter(is.na(death_date) | death_date > as.Date("2016-01-01"))
+
+demographic1 |>
+  tabyl(race_eth, birth_sex) |>
+  adorn_totals(c("row", "col")) |>
+  adorn_percentages() |>
+  adorn_pct_formatting() |>
+  adorn_ns() |>
+  adorn_title() |> 
+  kable("html", caption = "Participant race & sex") |>
+  kable_styling()
+```
+
+# Insurance
+
+```{r}
+insurance1 <- insurance |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  select(patient_key, insurance_type, insurance_start_date, qualifying_visit1, orig_uncentrytocare) |>
+  mutate(patient_key = as.character(patient_key),
+         insurance_type = ifelse(insurance_type %in% c("other public insurance (specify)", "uninsured/self-pay", "unknown insurance status"), "other", insurance_type),
+         insurance_typef = factor(insurance_type, levels = c("private", "medicare", "medicaid", "other"))) |>
+  group_by(patient_key, insurance_type) |>
+  slice(which.min(insurance_start_date)) |>
+  ungroup() |>
+  filter(patient_key %in% demographic1$patient_key) |>
+  select(patient_key, insurance_typef, insurance_start_date, qualifying_visit1, orig_uncentrytocare)
+
+insurance1 |>
+  tabyl(insurance_typef) |> 
+  adorn_pct_formatting() |>
+  kable("html", caption = "Participant insurance type") |>
+  kable_styling()
+```
+
+# Residence
+
+```{r}
+# Area Deprivation Index 2022 data
+adi1 <- adi |>
+  clean_names() |>
+  # Remove last digit from census block group to get census tract
+  mutate(geoid = sub("\\d$", "", fips),
+         adi_staterank = as.numeric(adi_staterank)) |>
+  filter(!is.na(adi_staterank)) |>
+  select(geoid, adi_staterank) |>
+  # Get median rank of block groups and assign to tract
+  group_by(geoid) |>
+  mutate(rank_median = round(median(adi_staterank))) |>
+  ungroup() |>
+  select(-adi_staterank) |>
+  distinct()
+
+# Supplementary geocodes file, UCHCC only
+fips1 = fips |>
+  select(patient_key, fips_census_tract, extract_date) |>
+  mutate(patient_key = as.character(patient_key)) |>
+  rename(geographic_date = extract_date)
+
+# CNICS geocodes table
+geographic1 <- geographic |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  group_by(patient_key, geoid) |>
+  slice(which.max(geographic_date)) |>
+  ungroup() |>
+  mutate(patient_key = as.character(patient_key)) |>
+  filter(patient_key %in% demographic1$patient_key) |>
+  select(patient_key, geographic_date, zip_code, city, state, geoid, census_tract) |>
+  left_join(fips1) |>
+  mutate(geoid = ifelse(geoid == "", fips_census_tract, geoid)) |>
+  select(patient_key, geographic_date, zip_code, city, state, geoid, census_tract) |>
+  filter(!is.na(geoid)) |>
+  left_join(adi1)
+
+geographic1 |>
+  tabyl(rank_median) |> 
+  adorn_pct_formatting() |>
+  kable("html", caption = "Participant neighborhood deprivation decile") |>
+  kable_styling()
+```
+
+# HIV risk factor
+
+```{r}
+riskfactor1 <- riskfactor |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key),
+         gender = ifelse(str_detect(riskgender, "trans|non"), "other", riskgender),
+         risk = case_when(risk == "heterosexual contact - unspecified" ~ 1,
+                          risk == "injection drug use" ~ 2,
+                          risk == "men who have sex with men" ~ 3,
+                          risk == "perinatal" ~ 4,
+                          risk == "receipt of blood transfusion, blood components, or tissue" ~ 5,
+                          risk == "worked in health care or laboratory setting" ~ 6,
+                          risk == "other" ~ 7),
+         riskf = factor(risk, labels = c("hetero", "idu", "msm", "perinatal", "blood_tissue", "health_lab", "other_risk"))) |>
+  filter(patient_key %in% demographic1$patient_key) |>
+  select(patient_key, riskf, gender)
+
+riskfactor2 <- riskfactor1 |>
+  mutate(a = TRUE) |>
+  pivot_wider(names_from = riskf, values_from = a, values_fill = FALSE, names_prefix = "risk_")
+
+riskfactor1 |>
+  tabyl(gender, riskf) |>
+  adorn_totals(c("row", "col")) |>
+  adorn_percentages() |>
+  adorn_pct_formatting() |>
+  adorn_ns() |>
+  adorn_title()
+```
+
+# Merge demographic variables
+
+```{r}
+demographic2 <- demographic1 |>
+  left_join(insurance1 |> select(patient_key, insurance_typef, insurance_start_date)) |>
+  left_join(geographic1 |> select(patient_key, geographic_date, rank_median), relationship = "many-to-many") |>
+  left_join(riskfactor2 |> select(-c(gender, risk_other_risk)))
+names(demographic2)
+n_distinct(demographic2$patient_key)
+```
+
+```{r}
+# write_rds(demographic1, "J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations/sepsis_hosp_rproj/demographic.rds")
+```
