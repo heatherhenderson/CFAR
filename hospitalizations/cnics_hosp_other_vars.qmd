@@ -1,0 +1,415 @@
+---
+title: "Hospitalizations in CNICS"
+author: "Henderson, Heather"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+format: html
+self-contained: true
+toc: true
+toc-depth: 4
+code-fold: true
+editor: visual
+---
+
+```{r}
+#| include: false
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+```{r}
+#| label: load-packages
+#| echo: false
+#| output: false
+packages <- function(x) {
+  for (i in x) {
+    if (!require(i, character.only = TRUE)) {
+      install.packages(i, dependencies = TRUE)
+      library(i, character.only = TRUE)
+    }
+  }
+}
+packages(c("haven", "readxl", "readr", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", "kableExtra", "DT", "formatR", "zoo", "janitor", "tableone", "broom", "arsenal", "RColorBrewer", "colorspace"))
+```
+
+# Data files
+
+```{r}
+#| echo: false
+setwd("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations/sepsis_hosp_rproj")
+
+demographic <- read_rds("demographic.rds")
+diagnosis <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/diagnosis.sas7bdat")
+dischargedx <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/dischargedx.sas7bdat")
+hospitalization <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/hospitalization.sas7bdat")
+lab <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/lab.sas7bdat")
+medication <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/medication.sas7bdat")
+mortality <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/mortality.sas7bdat")
+procedure <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/procedure.sas7bdat")
+visits <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2025_03/FINAL/visitappointment.sas7bdat")
+meds_list <- read_excel("C:/Users/henderh/OneDrive - University of North Carolina at Chapel Hill/Projects/Grants/CFAR grants/CFAR_Development_Award/Sepsis Dev project/meds_list.xlsx")
+```
+
+# Hospitalizations
+
+```{r}
+hospitalization <- hospitalization |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key)) |>
+  filter(admit_date >= as.Date("2016-01-01")) |> 
+  select(patient_key, admit_date, discharge_date, encounter_id)
+
+# Merge demographics, derive age and year
+hospitalization1 <- hospitalization |>
+  inner_join(demographic, by = "patient_key") |>
+  mutate(birth_mid = ymd(paste0(birth_year, "-07-01")),
+         age_at_admit = pmax(floor(as.numeric(admit_date - birth_mid) / 365.25), 18),
+         admit_yr = year(admit_date)) |>
+  arrange(patient_key, admit_date)
+
+# Identify transfer-linked admissions
+hospitalization2 <- hospitalization1 |>
+  group_by(patient_key) |>
+  # Incorporate transfers into single admission
+  mutate(gap_to_new_admit = (admit_date != lag(discharge_date)),
+         # First admission will be NA, replace with TRUE
+         gap_to_new_admit = replace_na(gap_to_new_admit, TRUE),
+         # Cumulative sum of gap_to_new_admit to assign same number to linked admissions
+         episode_id = cumsum(gap_to_new_admit)) |>
+  ungroup() |>
+  group_by(patient_key, episode_id) |>
+  mutate(encounter_id = first(encounter_id),
+         admit_date = min(admit_date),
+         discharge_date = max(discharge_date),
+         encounter_id_new = paste0(patient_key, "_", admit_date)) |>
+  ungroup() |>
+  select(-c(gap_to_new_admit, episode_id)) |>
+  distinct()
+
+# Handle duplicates based on newly created ID
+dups <- hospitalization2 |>
+  group_by(patient_key) |>
+  filter(encounter_id_new == lead(encounter_id_new)) |>
+  ungroup()
+
+# Remove duplicates and readmissions, fill missing encounter_id
+hospitalization3 <- hospitalization2 |>
+  anti_join(dups) |>
+  mutate(encounter_id = ifelse(encounter_id == "", encounter_id_new, encounter_id)) |>
+  group_by(patient_key) |>
+  mutate(time_to_readmit = as.numeric(admit_date - lag(discharge_date))) |>
+  ungroup() |>
+  filter(is.na(time_to_readmit) | time_to_readmit > 30) |>
+  select(-c(birth_mid, time_to_readmit, encounter_id_new))
+
+n_distinct(hospitalization3$patient_key)
+n_distinct(hospitalization3$encounter_id)
+
+rm(dups)
+# 914 patients, 2051 admissions
+```
+
+# Procedures
+
+```{r}
+procedure <- procedure |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key))
+
+# Merge hospital admissions, limit procedures to those within admission dates
+procedure_hosp <- procedure  |>
+  inner_join(hospitalization3, by = "patient_key", relationship = "many-to-many") |>
+  filter(procedure_date >= admit_date, 
+         procedure_date <= discharge_date) |>
+  select(patient_key, encounter_id, admit_date, discharge_date, procedure_date, site_procedure)
+
+n_distinct(procedure_hosp$encounter_id)
+```
+
+ICU stays and oxygen supplementation
+
+```{r}
+# Identify all critical care episodes
+procedure_icu <- procedure_hosp |>
+  mutate(icu = site_procedure %in% c("99291", "99292")) |> 
+  filter(icu) |>
+  select(patient_key, encounter_id, procedure_date, site_procedure, icu) |>
+  arrange(patient_key, encounter_id, procedure_date)
+
+# Identify all ICU stays, keep first ICU admission and total ICU days for each hospitalization
+icu_stays <- procedure_icu |>
+  group_by(encounter_id) |>
+  mutate(date_diff = as.integer(procedure_date - lag(procedure_date, default = first(procedure_date))),
+         new_icu_stay = is.na(lag(procedure_date)) | date_diff > 1,
+         icu_stay_count = cumsum(new_icu_stay)) |>
+  group_by(patient_key, encounter_id, icu_stay_count) |>
+  summarise(icu_start_date = min(procedure_date),
+            icu_end_date = max(procedure_date),
+            icu_los = as.integer(icu_end_date - icu_start_date) + 1,
+            .groups = "drop") |>
+  group_by(encounter_id) |>
+  mutate(icu_first_admit = min(icu_start_date),
+         icu_los_total = sum(icu_los)) |>
+  select(patient_key, encounter_id, icu_first_admit, icu_los_total) |>
+  distinct()
+
+# Add ICU stays to procedures dataset
+procedure_hosp1 <- procedure_hosp |>
+  select(patient_key, encounter_id, admit_date, discharge_date) |>
+  distinct() |>
+  left_join(icu_stays, relationship = "many-to-many")
+
+rm(icu_stays)
+```
+
+```{r}
+# Identify oxygen supplementation episodes
+procedure_oxygen_supp <- procedure_hosp |>
+  mutate(intubation = site_procedure %in% c("0bh17ez", "0bh18ez"),
+         noninv_oxygen = site_procedure %in% c("5a09357", "5a09358", "5a0935a", "5a09457", "5a0945a", "5a09557", "5a09558", "5a0955a", "94660")) |> 
+  filter(intubation | noninv_oxygen) |>
+  select(patient_key, encounter_id, procedure_date, site_procedure, intubation, noninv_oxygen) |>
+  arrange(patient_key, encounter_id, procedure_date)
+```
+
+Create 'basic' dataset, missing discharge disposition and hospital ID variables
+
+```{r}
+basic <- demographic |>
+  inner_join(hospitalization3) |>
+  left_join(procedure_hosp1) |>
+  select(patient_key, encounter_id, age_at_admit, birth_sex, race_eth, admit_date, discharge_date, admit_yr, icu_first_admit, icu_los_total)
+
+n_distinct(basic$patient_key)
+n_distinct(basic$encounter_id)
+summary(basic$age_at_admit)
+```
+
+# Diagnosis codes
+
+```{r}
+diagnosis <- diagnosis |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key))
+
+# Merge hospital admissions, limit to diagnoses within admission dates
+diagnosis1 <- diagnosis |>
+  inner_join(hospitalization3, relationship = "many-to-many") |>
+  filter(diagnosis_date >= admit_date,
+         diagnosis_date <= discharge_date) |>
+  mutate(dx_code = str_remove(diagnosis_name, "\\.")) |>
+  select(patient_key, encounter_id, admit_date, dx_code, diagnosis_date, cnics_std_group, cnics_std_category)
+```
+
+Create 'diagnoses_all' dataset
+
+```{r}
+dischargedx <- dischargedx |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key))
+
+# Merge discharge diagnosis data to get ranking variable
+diagnoses_all <- dischargedx |>
+  inner_join(hospitalization3, relationship = "many-to-many") |>
+  mutate(dx_code = str_remove(discharge_dx, "\\.")) |>
+  rename(diagnosis_date = discharge_dx_date) |>
+  distinct() |>
+  select(patient_key, encounter_id, dx_code, dx_code_name, diagnosis_date, ranking) |>
+  mutate(primary_dx = ifelse(ranking == 1, TRUE, FALSE))
+
+n_distinct(diagnoses_all$patient_key)
+n_distinct(diagnoses_all$encounter_id)
+```
+
+# Medications - vasopressors not available in CNICS data
+
+```{r}
+medication <- medication |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key))
+
+# Merge demographics, limit to Epic data, clean med names
+medication1 <- medication |>
+  filter(patient_key %in% demographic$patient_key,
+         src == "epic") |>
+  mutate(medication_name = str_replace_all(medication_name, "\\+|-", " "),
+         medication_name = str_squish(medication_name)) |>
+  select(patient_key, medication_name, start_date, end_date)
+
+# Merge CNICS meds list
+medication2 <- medication1 |>
+  # Add unique ID to track original rows
+  mutate(row_id = row_number(),
+         med_name_sep = medication_name) |>  
+  # Split by spaces into multiple rows
+  separate_rows(med_name_sep, sep = "\\s+") |>  
+  # Find matches by drug name
+  inner_join(meds_list, by = c("med_name_sep" = "medication_name")) |> 
+  # Merge back to original data by row ID to assign med type
+  left_join(medication1 |> mutate(row_id = row_number())) |> 
+  select(-row_id) |>
+  distinct() |>
+  mutate(route = case_when(str_detect(medication_name, "inject") ~ "injectable",
+                           str_detect(medication_name, "oral") ~ "oral",
+                           TRUE ~ "unspecified"))
+
+medication2 |>
+  tabyl(med_name_sep)
+# 29 meds found
+```
+
+# Labs - cultures not available in CNICS data
+
+```{r}
+lab <- lab |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key))
+
+# Merge hospital admissions, limit to labs within admission dates
+lab1 <- lab |>
+  mutate(result = as.numeric(result),
+         normal_min = as.numeric(normal_min),
+         normal_max = as.numeric(normal_max)) |>
+  inner_join(hospitalization3, relationship = "many-to-many") |>
+  filter(!is.na(result),
+         collect_date >= admit_date,
+         collect_date <= discharge_date)
+# Some results duplicated when reference ranges included in dataset
+```
+
+## Creatinine
+
+```{r}
+library(kidney.epi)
+
+lab_creatinine <- lab1 |>
+  filter(test_name == "creatinine")
+
+# Create variables for min/max creatinine, eGFR per day
+lab_creatinine1 <- lab_creatinine |>
+  group_by(encounter_id, collect_date) |>
+  mutate(cr_max = max(result),
+         cr_min = min(result),
+         egfr = round(egfr.ckdepi.cr.2009(creatinine = cr_max, 
+                                    age = age_at_admit, 
+                                    sex = birth_sex, 
+                                    ethnicity = race_eth,
+                                    creatinine_units = "mg/dl",
+                                    label_sex_male = c("male"), 
+                                    label_sex_female = c("female"),
+                                    label_afroamerican = c("black")))) |>
+  ungroup() |>
+  select(patient_key, age_at_admit, birth_sex, race_eth, encounter_id, admit_date, discharge_date, collect_date, cr_max, cr_min, normal_min, normal_max, egfr) |>
+  distinct()
+
+summary(lab_creatinine$result)
+summary(lab_creatinine1$egfr)
+```
+
+## Total bilirubin
+
+```{r}
+lab_tbili <- lab1 |>
+  filter(test_name == "bilirubin total")
+summary(lab_tbili$result)
+
+# Create variables for min/max bilirubin per day
+lab_tbili1 <- lab_tbili |>
+  group_by(encounter_id, collect_date) |>
+  mutate(tbili_max = max(result),
+         tbili_min = min(result)) |>
+  ungroup() |>
+  select(patient_key, encounter_id, admit_date, discharge_date, collect_date, tbili_max, tbili_min, normal_min, normal_max) |>
+  distinct()
+```
+
+## Platelets
+
+```{r}
+lab_platelet <- lab1 |>
+  filter(test_name == "platelet count")
+summary(lab_platelet$result)
+
+# Create variables for min/max platelets per day
+lab_platelet1 <- lab_platelet |>
+  group_by(encounter_id, collect_date) |>
+  mutate(plt_max = max(result),
+         plt_min = min(result)) |>
+  ungroup() |>
+  select(patient_key, encounter_id, admit_date, discharge_date, collect_date, plt_max, plt_min, normal_min, normal_max) |>
+  distinct()
+```
+
+## Lactate
+
+```{r}
+# lab_lactate <- lab1 |>
+#   filter(str_detect(test_name, "lactate"))
+# # 57% lactate, 43% LDH
+# 
+# lab_lactate1 <- lab_lactate |>
+#   group_by(encounter_id, collect_date) |>
+#   mutate(lactate_max = max(result),
+#          lactate_min = min(result)) |>
+#   ungroup() |>
+#   select(patient_key, encounter_id, admit_date, discharge_date, collect_date, lactate_max, lactate_min, normal_min, normal_max) |>
+#   distinct()
+```
+
+Create 'Laboratory' dataset
+
+```{r}
+laboratory <- hospitalization3 |>
+  select(patient_key, encounter_id, admit_date, discharge_date) |>
+  mutate(collect_date = map2(admit_date, discharge_date, ~ seq(.x, .y, by = "day"))) |>
+  unnest(collect_date) |>
+  left_join(lab_creatinine1 |> select(encounter_id, collect_date, cr_max, cr_min, egfr) |> distinct()) |>
+  left_join(lab_tbili1 |> select(encounter_id, collect_date, tbili_max, tbili_min) |> distinct()) |>
+  left_join(lab_platelet1 |> select(encounter_id, collect_date, plt_max, plt_min) |> distinct())
+```
+
+# HIV variables
+
+## HIV labs
+
+```{r}
+hiv_labs <- lab |>
+  filter(str_detect(test_name, "hiv|cd4"),
+         # Remove antigen/antibody tests
+         !str_detect(test_name, "anti")) |> 
+  select(patient_key, test_name, result, units, interpretation, collect_date, normal_min, normal_max, result_numeric)
+
+cd4_nadir <- hiv_labs |>
+  filter(test_name == "cd4 cell absolute") |>
+  select(patient_key, result, collect_date) |>
+  mutate(result = str_replace(result, "<", ""), # Check if OK to replace values with LOD
+         result = as.numeric(result)) |>
+  group_by(patient_key) |>
+  filter(result == min(result)) |>
+  slice_min(collect_date, with_ties = FALSE) |>
+  ungroup()
+summary(cd4_nadir$result)
+```
+
+## HIV visits
+
+```{r}
+visits <- visits |>
+  clean_names() |>
+  mutate_if(is.character, tolower) |>
+  mutate(patient_key = as.character(patient_key))
+
+visits1 <- visits |>
+  filter(appt_status == "arrived",
+         !(encounter_type == "urgent care" & encounter_location != "in hiv clinic"),
+         encounter_date > as.Date("2014-01-01")) |>
+  select(patient_key, encounter_date, encounter_location, department, visit_class) |>
+  arrange(patient_key, encounter_date)
+
+visits1 |>
+  tabyl(department, encounter_location)
+```
