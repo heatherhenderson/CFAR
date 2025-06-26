@@ -1,0 +1,114 @@
+---
+title: "Sepsis"
+author: "Henderson, Heather"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+packages <- function(x){
+  for(i in x){
+     if(!require(i, character.only = TRUE)){
+      install.packages(i, dependencies = TRUE)
+       library(i, character.only = TRUE)
+    }
+  }
+}
+packages(c("haven", "readxl", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", "kableExtra", "DT", "formatR", "zoo", "binom", "plotly", "janitor", "sjlabelled", "Hmisc", "rms", "aod", "sandwich", "lmtest", "tableone", "broom", "investr", "survival", "survminer"))
+```
+
+# Import data
+
+```{r message=FALSE, warning=FALSE}
+setwd("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations")
+
+hosp_dx <- read_excel("diagnoses_forreview_03_25.xlsx")
+angus <- read_excel("angus.xlsx")
+```
+
+```{r}
+df <- hosp_dx |>
+  mutate_all(tolower) |>
+  clean_names() |>
+  select(-c(explicit_consent, implicit_consent, contact_date, dx_code_set_name, dx_source, rawid)) |>
+  distinct() |>
+  rename(admit_date = earliest_adm_day,
+         disch_date = latest_disch_day) |>
+  mutate(dx_code = str_remove(dx_code, "\\."))
+# 3035 encounters
+```
+
+```{r}
+# Explicit codes
+df1 <- df |>
+  filter(str_detect(dx_code, "r652"))
+# 67, 2.2%
+
+# Martin codes
+martin <- c("a200", "a409", "a412", "a4101", "a4102", "a411", "a403", "a414", "a4150", "a413", "a4151", "a4152", "a4153", "a4159", "a4189", "a419", "r7881", "b488", "b49", "b377", "b376")
+df2 <- df |>
+  filter(dx_code %in% martin)
+# 266, 8.8%
+
+# SEP-1 codes
+sep1 <- c("a021", "a227", "a267", "a327", "a400", "a401", "a403", "a408", "a409", "a4101", "a4102", "a411", "a412", "a413", "a414", "a4150", "a4151", "a4152", "a4153", "a4159", "a4181", "a4189", "a419", "a427", "a5486", "b377", "r6520", "r6521")
+df3 <- df |>
+  filter(dx_code %in% sep1)
+# 215, 7.1%
+
+
+# Angus codes
+df4 <- df |>
+  inner_join(angus, by = c("dx_code" = "organ_dysfunction_angus"), relationship = "many-to-many") |>
+  select(pat_enc_csn_id, dx_code) |>
+  distinct() |>
+  rename(dx_code_org_dys = dx_code)
+
+df5 <- df |>
+  inner_join(angus, by = c("dx_code" = "infection"), relationship = "many-to-many") |>
+  select(pat_enc_csn_id, dx_code) |>
+  distinct() |>
+  rename(dx_code_inf = dx_code) |>
+  inner_join(df4, relationship = "many-to-many")
+# 421, 13.9%
+
+# Dombrovskiy codes
+df4 <- df |>
+  inner_join(angus, by = c("dx_code" = "organ_dysfunction_dombr"), relationship = "many-to-many") |>
+  select(pat_enc_csn_id, dx_code) |>
+  distinct() |>
+  rename(dx_code_org_dys = dx_code)
+
+df6 <- df |>
+  inner_join(angus, by = c("dx_code" = "infection"), relationship = "many-to-many") |>
+  select(pat_enc_csn_id, dx_code) |>
+  distinct() |>
+  rename(dx_code_inf = dx_code) |>
+  inner_join(df4, relationship = "many-to-many")
+# 436, 14.4%
+
+df3 |> tabyl(dx_code_name)
+n_distinct(df$pat_enc_csn_id)
+```
+
+```{r}
+all_admissions <- df1 |>
+  rbind(df2) |>
+  rbind(df3) |>
+  select(pat_enc_csn_id) |>
+  rbind(df5 |> select(pat_enc_csn_id)) |>
+  rbind(df6 |> select(pat_enc_csn_id)) |>
+  distinct()
+# 563, 18.6%
+```
+
+
+
+
