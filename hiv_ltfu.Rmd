@@ -1,0 +1,148 @@
+---
+title: "HIV LTFU"
+output: html_document
+date: '2022-05-26'
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+packages <- function(x) {
+  for (i in x) {
+    if (!require(i, character.only = TRUE)) {
+      install.packages(i, dependencies = TRUE)
+      library(i, character.only = TRUE)
+    }
+  }
+}
+packages(c("haven", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", 
+           "zoo", "janitor", "sjlabelled", "Hmisc", "rms", "aod", "broom", 
+           "tidymodels", "cmprsk", "survminer", "survival", "gridExtra"))
+```
+
+# **Data**
+
+```{r}
+setwd("C:/Users/henderh/Desktop/Projects/Lindsay")
+analysis_dataset <- read_sas("analysis_dataset.sas7bdat", NULL)
+glimpse(analysis_dataset)
+```
+
+```{r}
+df <- analysis_dataset %>%
+  mutate(id = row_number(),
+         timeframe = case_when(year_entry %in% c(1996:2001) ~ "1",
+                               year_entry %in% c(2002:2007) ~ "2",
+                               year_entry %in% c(2008:2013) ~ "3",
+                               year_entry %in% c(2014:2019) ~ "4"),
+         outcome_ltfu = case_when(ltfu == 1 ~ 1,
+                             died_in_care == 1 ~ 2,
+                             ltfu == 0 & died_in_care == 0 ~ 0),
+         outcome_rtc = case_when(rtc == 1 ~ 1,
+                             died_out_of_care == 1 ~ 2,
+                             rtc == 0 & died_out_of_care == 0 ~ 0)) %>%
+  select(id, cohortenrolldate, year_entry, ltfu, rtc, died_in_care, died_out_of_care, timefollow_up, timeframe, outcome_ltfu, outcome_rtc, time_rtc_death_cens)
+
+df %>%
+  tabyl(rtc, died_out_of_care, outcome_rtc)
+glimpse(df)
+
+df %>%
+  filter(!is.na(time_rtc_death_cens)) %>% tabyl(outcome_rtc, timeframe)
+```
+
+```{r}
+df %>% 
+  tabyl(timeframe, outcome_ltfu) %>%
+  adorn_totals("row") %>%
+  adorn_totals("col") %>%
+  adorn_percentages() %>%
+  adorn_pct_formatting() %>%
+  adorn_ns() %>%
+  adorn_title(placement = "top", row_name = "Timeframe", col_name = "LTFU")
+
+# a <- df %>% filter(timeframe %in% c("2", "3", "4"))
+ci_fit1 <- cuminc(ftime = df$timefollow_up, fstatus = df$outcome_ltfu, cencode = 0, group = df$timeframe)
+ci_fit1[["Tests"]]
+
+ciplotdat1 <- ci_fit1 %>% 
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id") %>% 
+  filter(id %in% c("1 1", "2 1", "3 1", "4 1")) %>% 
+  mutate(id = recode(
+    id, 
+    "1 1" = "1996-2001: ltfu", 
+    "2 1" = "2002-2007: ltfu",
+    "3 1" = "2008-2013: ltfu",
+    "4 1" = "2014-2019: ltfu")
+    ) %>% 
+  separate(id, c("timeframe", "event"), ":")
+
+ggplot(ciplotdat1, aes(x = time, y = est, color = timeframe)) +
+  geom_step(lwd = .5, aes(linetype = event))  +
+  ylim(c(0, 1)) +
+  xlim(c(730, 2200)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 14),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x = "Days", 
+       y = "Cumulative incidence",
+       title = "Loss to follow-up by time period") +
+  guides(linetype = "none")
+```
+
+```{r}
+df %>% 
+  tabyl(timeframe, outcome_rtc) %>%
+  adorn_totals("row") %>%
+  adorn_totals("col") %>%
+  adorn_percentages() %>%
+  adorn_pct_formatting() %>%
+  adorn_ns() %>%
+  adorn_title(placement = "top", row_name = "Timeframe", col_name = "RTC")
+
+# a <- df %>% filter(timeframe %in% c("2", "3", "4"))
+ci_fit2 <- cuminc(ftime = df$time_rtc_death_cens, fstatus = df$outcome_rtc, cencode = 0, group = df$timeframe)
+ci_fit2[["Tests"]]
+# ggcompetingrisks(ci_fit2, xlab = "Days", ylim = c(0,1), xlim = c(0,2200), multiple_panels = FALSE)
+
+ciplotdat2 <- ci_fit2 %>% 
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id") %>% 
+  filter(id %in% c("1 1", "2 1", "3 1", "4 1")) %>% 
+  mutate(id = recode(
+    id, 
+    "1 1" = "1996-2001: rtc", 
+    "2 1" = "2002-2007: rtc",
+    "3 1" = "2008-2013: rtc",
+    "4 1" = "2014-2019: rtc")
+    ) %>% 
+  separate(id, c("timeframe", "event"), ":")
+
+ggplot(ciplotdat2, aes(x = time, y = est, color = timeframe)) +
+  geom_step(lwd = .5, aes(linetype = event))  +
+  ylim(c(0, 1)) +
+  xlim(c(0, 2200)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 14),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  labs(x = "Days", 
+       y = "Cumulative incidence",
+       title = "Return to care by time period") +
+  guides(linetype = "none")
+```
+
+
+
+
+
+
+
+
+
