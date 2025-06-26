@@ -1,0 +1,568 @@
+---
+title: "Vaccinations in people with HIV"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+format: html
+self-contained: true
+toc: true
+toc-depth: 2
+editor: visual
+---
+
+```{r}
+#| label: load-packages
+#| echo: false
+#| output: false
+packages <- function(x) {
+  for (i in x) {
+    if (!require(i, character.only = TRUE)) {
+      install.packages(i, dependencies = TRUE)
+      library(i, character.only = TRUE)
+    }
+  }
+}
+packages(c("haven", "readxl", "readr", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", "clock", "kableExtra", "DT", "formatR", "zoo", "binom", "plotly", "janitor", "sjlabelled", "Hmisc", "rms", "aod", "sandwich", "lmtest", "tableone", "broom", "pooling", "glmnet", "caret", "class", "investr", "creditmodel", "furniture", "arsenal", "RColorBrewer"))
+```
+
+```{r}
+#| label: raw-data
+procedures <- read_rds("J:/ID/CFAR/ID Clinic Database/Projects/thibaut/UCHCC/Procedures/Data/procedures.rds")
+vax_lookup <- read_excel("C:/Users/henderh/Desktop/Projects/vaccines_in_pwh/vax_lookup.xlsx", col_types = c("text", "text", "text", "text", "text", "text", "text", "text", "text", "text", "text", "text"))
+dobs <- read_sas("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Data/7_25_2023/table01_demogs.sas7bdat")
+hiv_care <- read_sas("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Data/7_25_2023/table02_hivcare.sas7bdat")
+hiv_labs <- read_sas("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Data/7_25_2023/table03_labs.sas7bdat")
+visits_pre_epic <- read_sas("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Data/7_25_2023/table04_visits_pre.sas7bdat")
+visits_post_epic <- read_sas("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Data/7_25_2023/table05_visits_post.sas7bdat")
+```
+
+# **Data cleaning**
+
+```{r}
+#| label: cleaning-uchcc-data
+dobs <- dobs |> mutate(patient_key = as.character(patient_key))
+hiv_care <- hiv_care |> mutate(patient_key = as.character(patient_key))
+hiv_labs <- hiv_labs |> mutate(patient_key = as.character(patient_key))
+
+visits <- visits_post_epic |>
+  clean_names() |>
+  mutate_all(tolower) |>
+  filter(encounter_type %in% c("office visit", "telemedicine")) |>
+  select(patient_key, visit_date) |>
+  mutate(visit_date = as.Date(visit_date)) |>
+  full_join(visits_pre_epic |> mutate(patient_key = as.character(patient_key))) |>
+  filter(visit_date >= as.Date("1996-01-01"),
+         visit_date <= as.Date("2022-12-31")) |>
+  arrange(patient_key, visit_date)
+n_distinct(visits$patient_key)
+# N = 5655
+uchcc <- dobs |>
+  left_join(hiv_care) |>
+  left_join(hiv_labs) |>
+  left_join(visits, relationship = "many-to-many") |>
+  clean_names() |>
+  mutate_at(c("patient_key", "hiv_pos", "meetscohortreq"), tolower) |>
+  select(-c(dxdatetrust, entrytocare, start_trust, unc_start_trust)) |>
+  distinct()
+
+n_distinct(uchcc$patient_key)
+# N = 7832
+```
+
+## **Determine patients receiving primary care during 1996-2022**
+Office visits or telemedicine at UNC ID Clinic
+
+```{r}
+#| label: patients-to-include-1
+incl_pts1 <- uchcc |>
+  select(patient_key, cohortenrolldate, cohortvisit2date) |>
+  distinct() |>
+  mutate(t = as.numeric(cohortvisit2date - cohortenrolldate)) |>
+  filter(t %in% c(1:365)) |> # Select pts with cohort enroll and visit2 date within 1 yr
+  select(-c(t, cohortvisit2date))
+# N = 5668
+```
+
+```{r}
+#| label: patients-to-include-2
+incl_pts2 <- uchcc |>
+  anti_join(incl_pts1, by = "patient_key") |> # Select pts not found above to meet inclusion criteria
+  select(patient_key, test_date) |>
+  distinct() |>
+  group_by(patient_key) |>
+  arrange(patient_key, test_date) |>
+  mutate(n = row_number(), # Add visit counter
+         t = -(as.numeric(test_date - dplyr::lead(test_date)))) |> # Get # days to next lab
+  ungroup() |>
+  add_count(patient_key) |>
+  filter(nn > 1) |> # Select pts with >1 lab
+  group_by(patient_key) |>
+  filter(t <= 365) |> # Select pts with >=2 labs within 1 yr
+  slice(which.min(test_date)) |> # Select 1st lab date
+  ungroup() |>
+  rename(cohortenrolldate = test_date) |> # Assign 1st of >=2 labs in 1 yr as cohort enrollment date
+  select(-c(n, nn, t))
+```
+
+```{r}
+#| label: patients-to-include-final
+incl_pts <- incl_pts1 |>
+  rbind(incl_pts2) |>
+  distinct() |>
+  filter(cohortenrolldate >= as.Date("1996-01-01"),
+         cohortenrolldate <= as.Date("2022-12-31"))
+
+rm(incl_pts1, incl_pts2)
+# N = 5788
+```
+
+## **Determine time in care using HIV labs**
+
+```{r}
+#| label: person-time-1
+labs1 <- hiv_labs |>
+  select(patient_key, test_date) |>
+  inner_join(incl_pts) |> # Limit to pts meeting inclusion criteria
+  group_by(patient_key) |>
+  arrange(patient_key, test_date) |>
+  mutate(visit_num = row_number(),
+         days_since_last = as.numeric(test_date - dplyr::lag(test_date))) |> # Get days between HIV labs
+  ungroup() |>
+  mutate(t0 = ifelse(visit_num == 1, test_date, NA), # Set first test date as t0
+         t0 = as.Date(ifelse(days_since_last > 545 & is.na(t0), test_date, t0))) |> # Reset t0 for re-entry if new lab >18 months after last one
+  left_join(dobs)
+  #filter((test_date - dob) / 365.25 > 18)
+```
+
+```{r}
+#| label: person-time-2
+labs2 <- labs1 |>
+  fill(t0, .direction = "down") |>
+  mutate(x = ifelse(visit_num == max(visit_num) & !is.na(t0), TRUE, FALSE), # Indicator variable for visits not contributing to time in care
+         days_since_t0 = as.numeric(test_date - t0), .by = patient_key) |> # Days from t0 to lab date
+  filter(!x,
+         days_since_t0 == 0 | days_since_t0 >= 90) |> # Remove lab dates not contributing to time in care, including those within 90 days of t0
+  select(-c(x, days_since_t0, visit_num))
+```
+
+```{r}
+#| label: person-time-final
+labs <- labs2 |>
+  mutate(lab_num = row_number(),
+         tf = max(test_date) + 365, .by = c(patient_key, t0)) |> # Set tf as 12 months after last lab date - ltfu
+  add_count(patient_key, t0) |>
+  filter(n > 1, # Remove single labs with no follow-up within 18 months
+         t0 <= as.Date("2022-12-31"),
+         tf >= as.Date("1996-01-01")) |> 
+  select(patient_key, t0, tf) |>
+  distinct() |>
+  mutate(days_in_care = as.numeric(tf - t0)) |>
+  mutate(person_time = sum(days_in_care), .by = patient_key,
+         tf = ifelse(tf > as.Date("2022-12-31"), as.Date("2022-12-31"), tf),
+         tf = as.Date(tf))
+
+n_distinct(labs$patient_key)
+labs3 <- labs |>
+  select(patient_key, person_time) |>
+  distinct()
+sum(labs3$person_time) / 365.25
+quantile(round(labs3$person_time / 365.25, 1))
+rm(labs1, labs2, labs3)
+# N = 4953
+# 40,360 person-years
+```
+
+## **Procedures data**
+
+```{r}
+#| label: cleaning-procedures-data
+procedures1 <- procedures |>
+  filter(patient_key %in% labs$patient_key) |> # Select pts meeting inclusion criteria
+  select(-c(pat_enc_csn_id, result, comments, rawid))|>
+  left_join(dobs |> mutate(patient_key = as.character(patient_key))) |> # Add DOBs
+  mutate(procedure_date = as.Date(procedure_date),
+         visit_yr = year(procedure_date),
+         age = floor(as.numeric(procedure_date - dob) / 365.25)) |>
+  filter(procedure_date >= as.Date("1996-01-01") & procedure_date <= as.Date("2022-12-31")) |>
+         #age >= 18) |> 
+  filter(px_category %in% c("", "cpt")) |>
+  mutate(procedure_name = str_remove(procedure_name, "\\[.*"), # Remove text in brackets
+         procedure_name = trimws(procedure_name, which = "both")) # Remove white space
+
+n_distinct(procedures1$patient_key)
+# N = 4560
+```
+
+### Vaccines
+
+```{r}
+# #| label: find-vaccines
+vax1 <-  procedures1 |>
+  mutate(sars_cov2 = ifelse((procedure_code %in% vax_lookup$sars_cov2) | str_detect(procedure_name, "covid"), TRUE, FALSE),
+         hav = ifelse(procedure_code %in% vax_lookup$hav, TRUE, FALSE) | str_detect(procedure_name, "hepatitis a vacc|hep a") & procedure_code == "",
+         hbv = ifelse(procedure_code %in% vax_lookup$hbv, TRUE, FALSE) | str_detect(procedure_name, "hepatitis b vacc|hep b|hepb") & procedure_code == "",
+         hpv = ifelse(procedure_code %in% vax_lookup$hpv, TRUE, FALSE) | str_detect(procedure_name, "hpv") & procedure_code == "",
+         influenza = ifelse((procedure_code %in% vax_lookup$influenza) | str_detect(procedure_name, "influenza"), TRUE, FALSE),
+         #mmr = ifelse(procedure_code %in% vax_lookup$mmr, TRUE, FALSE) | str_detect(procedure_name, "mmr|measles") & procedure_code == "",
+         mpox = ifelse(procedure_code %in% vax_lookup$mpox, TRUE, FALSE) | str_detect(procedure_name, "pox") & procedure_code == "",
+         meng_acwy = ifelse(procedure_code %in% vax_lookup$meng_acwy, TRUE, FALSE),
+         pneumo = ifelse((procedure_code %in% vax_lookup$pneumococcal) | str_detect(procedure_name, "pneumococcal|pneumovax|pcv13|ppsv23"), TRUE, FALSE),
+         tet_combo = ifelse(procedure_code %in% vax_lookup$tet_combo, TRUE, FALSE) | str_detect(procedure_name, "td|dt|tetanus|dipth") & procedure_code == "",
+         zoster = ifelse(procedure_code %in% vax_lookup$zoster, TRUE, FALSE) | str_detect(procedure_name, "zost|shing") & procedure_code == "")
+```
+
+```{r}
+#| label: vaccines-dataset
+vax <- vax1 |>
+  filter(hav | hbv | hpv | influenza | meng_acwy | mpox | pneumo | sars_cov2 | tet_combo | zoster) |>
+  distinct() |>
+  mutate(vaccine = case_when(hav ~ "hav",
+                             hbv ~ "hbv",
+                             hpv ~ "hpv",
+                             influenza ~ "influenza",
+                             meng_acwy ~ "meng_acwy",
+                             mpox ~ "mpox",
+                             pneumo ~ "pneumo",
+                             sars_cov2 ~ "sars_cov2",
+                             tet_combo ~ "tet_combo",
+                             zoster ~ "zoster"),
+         vax_yr = year(procedure_date)) |>
+  select(patient_key, age, vax_yr, vaccine) |>
+  distinct() |>
+  filter(vax_yr <= 2022)
+
+rm(vax1)
+num_patients <- n_distinct(vax$patient_key) 
+num_patients
+# N = 4319
+
+#vaccine = factor(vaccine, levels = c("hav", "hbv", "hpv", "influenza", "meng_acwy", "mpox", "pneumo", "sars_cov2", "tet_combo", "zoster"), labels = c("Hep A", "Hep B", "HPV", "Influenza", "Mening ACWY", "Mpox", "Pneumo", "SARS-CoV-2", "Tetanus-Dipth", "Zoster")
+```
+
+Number of unique patients: `r patients`
+
+```{r}
+#| label: years-in-care
+yrs_in_care <- labs |>
+  rename(care_start = t0,
+         care_stop = tf) |>
+  group_by(patient_key) |>
+  mutate(time_period = row_number()) |> # Add counter for time period in care
+  pivot_longer(cols = c(care_start, care_stop), names_to = "dates_in_care", values_to = "yr_in_care") |> # Make vertical
+  mutate(yr_in_care = year(yr_in_care))  |>
+  group_by(patient_key, time_period) |>
+  complete(yr_in_care = seq(min(yr_in_care), max(yr_in_care))) |> # Fill in years between start and end dates for each time period
+  ungroup() |>
+  select(patient_key, yr_in_care) |>
+  distinct() |>
+  filter(yr_in_care >= 1996)
+```
+
+```{r}
+# a <- yrs_in_care |>
+#   group_by(patient_key) |>
+#   slice(which.min(dt)) |>
+#   ungroup() |>
+#   select(patient_key, dt, cohortenrolldate) |>
+#   mutate(tdiff = cohortenrolldate - dt) |>
+#   filter(tdiff > 1)
+# 
+# a1 <- visits |>
+#   group_by(patient_key) |>
+#   slice(which.min(visit_date)) |>
+#   mutate(visit_date = year(visit_date)) |>
+#   ungroup() |>
+#   inner_join(a)
+# 
+# hiv_care |> filter(patient_key == "1174")
+
+# 813 / 5314 with cohort enroll dates >1 year later than entry to care based on labs - which dates should be used?
+```
+
+```{r}
+#| label: years-vaccinated
+vax_yrs <- yrs_in_care |>
+  rename(vax_yr = yr_in_care) |>
+  left_join(vax, relationship = "many-to-many") |>
+  left_join(dobs) |>
+  select(patient_key, age, dob, vax_yr, vaccine) |>
+  mutate(month = 1,
+         day = 1,
+         age = floor(as.numeric(date_build(vax_yr, month, day) - dob) / 365.25)) |>
+  select(-c(month, day, dob)) |>
+  distinct()
+
+vax_yrs1 <- vax_yrs |>
+  arrange(vaccine) |>
+  mutate(a = 1) |>
+  pivot_wider(names_from = vaccine, values_from = a) |>
+  arrange(patient_key, vax_yr) |>
+  group_by(patient_key) |>
+  fill(c(4:6, 8:14), .direction = "down") |> # Set to TRUE if 1 dose received for all except influenza
+  ungroup() |>
+  select(-"NA") |>
+  mutate_all(~replace_na(., 0))
+
+n_distinct(vax_yrs1$patient_key)
+# N = 4992, 4953 >=18
+```
+
+## **HPV**
+
+```{r}
+hpv <- vax_yrs1 |>
+  select(patient_key, age, vax_yr, hpv) |>
+  group_by(patient_key) |>
+  mutate(rownum = row_number(),
+         hpv2 = case_when(vax_yr < 2011 ~ 2, # New variable to identify those not eligible
+                         rownum == 1 & age > 26 ~ 2, # Vaccine not recommended for age >26
+                         TRUE ~ hpv)) |> # Keep value of 1 for those who received it and meet recommendation
+  fill(hpv2, .direction = "down") |> # Fill values of 1 or 2 for all subsequent years
+  ungroup() |>
+  mutate(hpv = ifelse(vax_yr >= 2011 & age <= 26 & is.na(hpv), 0, hpv)) |> # Set as 0 for those eligible if not 1
+  group_by(patient_key) |>
+  fill(hpv, .direction = "down") |> # Fill value of 0 or 1 for all subsequent years in original variable
+  ungroup() |>
+  mutate(hpv = ifelse(is.na(hpv), hpv2, hpv)) |> # Replace missing values in original variable
+  select(-c(rownum, hpv2))
+
+hpv |> 
+  filter(hpv == 1) |>
+  group_by(patient_key) |>
+  slice(which.min(vax_yr)) |>
+  filter(age <= 26) |>
+  n_distinct()
+# 98 <26 years
+hpv |>
+  filter(vax_yr >= 2011 & age <= 26) |>
+  select(patient_key) |>
+  n_distinct()
+# 613 eligible <26 years
+```
+
+## **HAV**
+
+```{r}
+#| label: hav
+vax_hav <- vax_all1 |>
+  select(patient_key, hav) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & hav)
+vax_hav |> tabyl(hav)
+```
+
+```{r}
+#| label: hbv
+vax_hbv <- vax_all1 |>
+  select(patient_key, hbv) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & hbv)
+vax_hbv |> tabyl(hbv)
+```
+
+```{r}
+#| label: hpv
+# Up to 45 years
+vax_hpv <- vax_all1 |>
+  filter(vax_yr >= 2011,
+         age <= 26) |>
+  select(patient_key, hpv) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & hpv)
+vax_hpv |> tabyl(hpv)
+```
+
+```{r}
+#| label: influenza
+vax_influenza <- vax_all1 |>
+  select(patient_key, influenza) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & influenza)
+vax_influenza |> tabyl(influenza)
+```
+
+```{r}
+#| label: mening
+vax_meng_acwy <- vax_all1 |>
+  filter(vax_yr >= 2016) |>
+  select(patient_key, meng_acwy) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & meng_acwy)
+vax_meng_acwy |> tabyl(meng_acwy)
+```
+
+```{r}
+#| label: mpox
+vax_mpox <- vax_all1 |>
+  filter(vax_yr >= 2022) |>
+  select(patient_key, mpox) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & mpox)
+vax_mpox |> tabyl(mpox)
+```
+
+```{r}
+#| label: pneumo
+vax_pneumo <- vax_all1 |>
+  select(patient_key, pneumo) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & pneumo)
+vax_pneumo |> tabyl(pneumo)
+```
+
+```{r}
+#| label: sars_cov2
+vax_sars_cov2 <- vax_all1 |>
+  filter(vax_yr >= 2021) |>
+  select(patient_key, sars_cov2) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & sars_cov2)
+vax_sars_cov2 |> tabyl(sars_cov2)
+# 7 vaccinated in 2020
+```
+
+```{r}
+#| label: tet_combo
+vax_tet_combo <- vax_all1 |>
+  select(patient_key, tet_combo) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & tet_combo)
+vax_tet_combo |> tabyl(tet_combo)
+```
+
+```{r}
+#| label: zoster
+vax_zoster <- vax_all1 |>
+  filter(vax_yr >= 2012,
+         age >= 19) |>
+  select(patient_key, zoster) |>
+  distinct() |>
+  add_count(patient_key) |>
+  filter(n == 1 | n == 2 & zoster)
+vax_zoster |> tabyl(zoster)
+```
+
+# Vaccines by year
+## All vaccines
+
+```{r}
+#| label: table-all-vax
+vax1 |>
+  select(patient_key, vax_yr, vaccine) |>
+  distinct() |>
+  tabyl(vax_yr, vaccine) |>
+  adorn_totals(c("row", "col")) |>
+  adorn_percentages() |>
+  adorn_pct_formatting() |>
+  adorn_ns() |> 
+  kable("html") |>
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, fixed_thead = TRUE)
+```
+
+## SARS-CoV-2
+
+```{r}
+#| label: table-covid-vax
+covid <- vax1 |>
+  filter(vaccine == "SARS-CoV-2") |>
+  select(patient_key, procedure_date, vax_yr)|>
+  mutate(vax_effect_date = procedure_date + 14) |>
+  group_by(patient_key) |>
+  mutate(t_dose = as.numeric(vax_effect_date - dplyr::lag(vax_effect_date))) |>
+  ungroup()
+
+covid1 <- covid  |>
+  filter(t_dose >= 14 | is.na(t_dose)) |>
+  group_by(patient_key) |>
+  mutate(dose_num = row_number()) |>
+  slice(which.max(dose_num)) |>
+  ungroup() |>
+  mutate(dose_num1 = ifelse(dose_num > 5, 6, dose_num),
+         dose_num1 = factor(dose_num1, 
+                            levels = c(1,2,3,4,5,6), 
+                            labels = c("1", "2", "3", "4", "5", "\u22656")),
+         dose_num2 = ifelse(dose_num > 3, 4, dose_num),
+         dose_num2 = factor(dose_num2, 
+                            levels = c(1,2,3,4), 
+                            labels = c("1", "2", "3", "\u22654")))
+
+covid1 |>
+  tabyl(visit_yr, dose_num1)  |>
+  adorn_totals(c("row", "col")) |>
+  adorn_percentages() |>
+  adorn_pct_formatting() |>
+  adorn_ns() |> 
+  adorn_title() |> 
+  kable("html") |>
+  kable_styling()
+```
+
+```{r}
+#| label: chart-covid-vax
+covid2 <- covid1 |>
+  select(patient_key, visit_yr, dose_num2) |>
+  distinct() |>
+  group_by(visit_yr, dose_num2) |>
+  summarise(n = n()) |>
+  ungroup() |>
+  left_join(n_per_yr) |>
+  mutate(prop_vax = n / total,
+         dose_num2 = factor(dose_num2))
+
+ggplot(covid2, aes(x = visit_yr, y = prop_vax, fill = dose_num2)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = n),
+    colour = "white", size = 3,
+    vjust = 1.5, 
+    position = position_dodge(.9)) +
+  scale_fill_brewer(palette = "RdBu") +
+  theme_classic() +
+  scale_y_continuous(name = "Proportion vaccinated", 
+                     limits = c(0, .4)) +
+  xlab("Year") +
+  ggtitle("Last SARS-CoV-2 vaccine dose received", 
+          subtitle = "Proportion of patients with any procedure code") +
+  guides(fill = guide_legend(title = "Dose number",
+                             direction = "horizontal")) +
+  theme(legend.position = "bottom")
+```
+
+## Influenza
+
+```{r}
+#| label: chart-flu-vax
+flu <- vax1 |>
+  select(patient_key, influenza, vax_yr) |>
+  distinct() |>
+  add_count(patient_key, vax_yr) |>
+  filter(n == 1 | (n == 2 & influenza)) |>
+  select(-n)
+
+flu1 <- flu |>
+  filter(influenza) |>
+  group_by(vax_yr) |>
+  summarise(n = n()) |>
+  ungroup() |>
+  left_join(n_per_yr) |>
+  mutate(prop_vax = round(n / total, 2))
+
+ggplot(flu1) +
+  geom_col(aes(x = vax_yr, y = n), fill = "lightblue3") +
+  geom_line(aes(x = visit_yr, y = prop_vax * 2000), 
+            colour = "darkred") +
+  scale_y_continuous(name = "Number vaccinated",
+                     limits = c(0, 2000),
+                     sec.axis = sec_axis(trans = ~./2000)) +
+  scale_x_continuous(name = "Year", 
+                     breaks = seq(1996, 2023, 3)) +
+  theme_classic() +
+  ggtitle("Number and proportion receving influenza vaccine by year", 
+          subtitle = "Among patients with any procedure code")
+```
